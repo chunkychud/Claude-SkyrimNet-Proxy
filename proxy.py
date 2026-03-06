@@ -20,7 +20,7 @@ import shutil
 import os
 import copy
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Optional
 
 import uvicorn
@@ -134,6 +134,7 @@ async def interceptor_handler(request):
         auth.body_template = parsed
         template_size = len(json.dumps(parsed))
         logger.info(f"Captured {len(auth.headers)} headers + template ({template_size:,} bytes, tools stripped)")
+        logger.info(f"New Auth code: {auth.headers.get("Authorization", "Error - No Auth Found")}")
 
     # Forward to real API
     async with aiohttp.ClientSession() as session:
@@ -142,24 +143,13 @@ async def interceptor_handler(request):
             return web.Response(body=resp_body, status=resp.status,
                 headers={"Content-Type": resp.headers.get("Content-Type", "text/event-stream")})
 
-
-async def start_interceptor():
-    """Start MITM interceptor and capture auth from a clean temp dir."""
-    iapp = web.Application()
-    iapp.router.add_route("*", "/{path_info:.*}", interceptor_handler)
-
-    runner = web.AppRunner(iapp)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", INTERCEPTOR_PORT)
-    await site.start()
-    logger.info(f"Interceptor on port {INTERCEPTOR_PORT}")
-
+async def capture_auth():
     # Use clean temp dir to minimize system-reminder bloat (no CLAUDE.md, no skills)
     with tempfile.TemporaryDirectory() as tmpdir:
         env = os.environ.copy()
         env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{INTERCEPTOR_PORT}"
 
-        logger.info("Warming up: capturing auth from claude --print...")
+        logger.info("Capturing auth from claude --print...")
         proc = await asyncio.create_subprocess_exec(
             CLAUDE_PATH, "--print",
             "--output-format", "text",
@@ -174,12 +164,16 @@ async def start_interceptor():
         )
         await asyncio.wait_for(proc.communicate(), timeout=60)
 
-    if auth.is_ready:
-        # Create persistent session for all future API calls
-        auth.session = aiohttp.ClientSession()
-        logger.info("Auth captured — direct API mode active (persistent session)")
-    else:
-        logger.error("Failed to capture auth headers!")
+async def start_interceptor():
+    """Start MITM interceptor and capture auth from a clean temp dir."""
+    iapp = web.Application()
+    iapp.router.add_route("*", "/{path_info:.*}", interceptor_handler)
+
+    runner = web.AppRunner(iapp)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", INTERCEPTOR_PORT)
+    await site.start()
+    logger.info(f"Interceptor on port {INTERCEPTOR_PORT}")
 
     return runner
 
@@ -250,7 +244,7 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
                 error_text = error_body.decode("utf-8", errors="replace")
                 logger.error(f"[{request_id}] API {resp.status}: {error_text[:300]}")
                 if resp.status in (401, 403) or "credential" in error_text.lower():
-                    logger.warning("Auth expired -- restart proxy to re-auth")
+                    logger.warning("Auth expired")
                     auth.headers = None
                     auth.body_template = None
                 raise HTTPException(status_code=resp.status, detail=error_text[:200])
@@ -317,7 +311,7 @@ async def call_api_streaming(system_prompt: Optional[str], messages: list, model
                 error_text = error_body.decode("utf-8", errors="replace")
                 logger.error(f"[{request_id}] API {resp.status}: {error_text[:300]}")
                 if resp.status in (401, 403) or "credential" in error_text.lower():
-                    logger.warning("Auth expired -- restart proxy to re-auth")
+                    logger.warning("Auth expired")
                     auth.headers = None
                     auth.body_template = None
                 # Yield an error chunk so client sees the failure
@@ -325,7 +319,7 @@ async def call_api_streaming(system_prompt: Optional[str], messages: list, model
                              "choices": [{"index": 0, "delta": {"content": f"[API Error {resp.status}]"}, "finish_reason": None}]}
                 yield f"data: {json.dumps(err_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
-                return
+                raise HTTPException(status_code=resp.status, detail=error_text[:200])
 
             # Stream Claude SSE -> OpenAI SSE
             # Send initial chunk with role
@@ -492,6 +486,7 @@ class ChatRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app):
     runner = await start_interceptor()
+    await capture_auth()
     yield
     if auth.session:
         await auth.session.close()
@@ -502,7 +497,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest):
+async def chat_completions(req: ChatRequest, retry=True):
     # Parse model list and pick via round-robin
     model_field = req.model or DEFAULT_MODEL
     models = parse_model_list(model_field)
@@ -548,13 +543,24 @@ async def chat_completions(req: ChatRequest):
             )
         response = await call_openrouter_direct(system_prompt, merged, model, max_tokens, **extra_params)
     else:
-        if req.stream:
-            return StreamingResponse(
-                call_api_streaming(system_prompt, merged, model, max_tokens),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
-        response = await call_api_direct(system_prompt, merged, model, max_tokens)
+        try:
+            if req.stream:
+                return StreamingResponse(
+                    call_api_streaming(system_prompt, merged, model, max_tokens),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            response = await call_api_direct(system_prompt, merged, model, max_tokens)
+        except HTTPException as e:
+            # Catching the auth invalidated
+            if e.status_code == 401 and retry == True:
+                auth.body_template = None
+                auth.headers = None
+                await capture_auth()
+
+                # Recurse back in, hopefully now with renewed auth
+                return await chat_completions(req, False)
+            raise e
 
     if not response:
         raise HTTPException(status_code=500, detail="Empty response")
