@@ -27,7 +27,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from aiohttp import web
 import aiohttp
 
@@ -478,9 +478,7 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = 4096
     temperature: Optional[float] = None
     stream: Optional[bool] = False
-
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 @asynccontextmanager
