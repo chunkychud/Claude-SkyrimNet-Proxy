@@ -9,6 +9,10 @@ Optimizations:
   - Clean temp dir capture: ~350 chars system-reminder vs ~16K (no CLAUDE.md bloat)
   - Persistent aiohttp session: reuses TCP+TLS connection (saves ~200-500ms/request)
   - Direct API calls: no subprocess per request
+
+Concurrency fix:
+  - Single-flight auth refresh: if auth expires and many requests arrive at once,
+    exactly ONE capture_auth() runs; others wait for it, then proceed.
 """
 
 import asyncio
@@ -60,7 +64,7 @@ def _save_config(data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
-# --- Auth cache + persistent session ---
+# --- Auth cache + persistent session (with single-flight refresh) ---
 
 class AuthCache:
     def __init__(self):
@@ -68,11 +72,51 @@ class AuthCache:
         self.body_template: Optional[dict] = None
         self.session: Optional[aiohttp.ClientSession] = None
 
+        # Single-flight refresh controls
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_task: Optional[asyncio.Task] = None
+
     @property
-    def is_ready(self):
+    def is_ready(self) -> bool:
         return self.headers is not None and self.body_template is not None
 
+    def invalidate(self) -> None:
+        self.headers = None
+        self.body_template = None
+
+    async def ensure_ready(self, *, force: bool = False, timeout: float = 60.0) -> None:
+        """
+        If auth is ready -> return.
+        If a refresh is already running -> wait for it.
+        Else -> start ONE capture_auth() and everyone waits for it.
+        """
+        async with self._refresh_lock:
+            if self.is_ready and not force:
+                return
+
+            # If a refresh is already running, reuse it.
+            if self._refresh_task and not self._refresh_task.done():
+                task = self._refresh_task
+            else:
+                # Start a new refresh
+                self.invalidate()
+                self._refresh_task = asyncio.create_task(capture_auth())
+                task = self._refresh_task
+
+        # Await outside the lock so other requests can queue behind the same task.
+        try:
+            await asyncio.wait_for(task, timeout=timeout)
+        finally:
+            if task.done():
+                async with self._refresh_lock:
+                    if self._refresh_task is task:
+                        self._refresh_task = None
+
+        if not self.is_ready:
+            raise RuntimeError("Auth refresh finished but headers/template were not captured")
+
 auth = AuthCache()
+
 
 # --- OpenRouter + Round-Robin state ---
 _cfg = _load_config()
@@ -121,27 +165,41 @@ async def interceptor_handler(request):
         async with aiohttp.ClientSession() as session:
             async with session.post(real_url, data=body, headers=headers) as resp:
                 resp_body = await resp.read()
-                return web.Response(body=resp_body, status=resp.status,
-                    headers={"Content-Type": resp.headers.get("Content-Type", "application/json")})
+                return web.Response(
+                    body=resp_body,
+                    status=resp.status,
+                    headers={"Content-Type": resp.headers.get("Content-Type", "application/json")},
+                )
 
     # Capture auth headers and body template
     if not auth.is_ready:
-        auth.headers = dict(headers)
+        # Build template locally, then assign both fields "atomically"
+        captured_headers = dict(headers)
+
         # Strip tool definitions (60KB dead weight) and extended thinking
         parsed.pop("tools", None)
         parsed.pop("thinking", None)
         parsed.pop("context_management", None)
-        auth.body_template = parsed
-        template_size = len(json.dumps(parsed))
+
+        captured_template = parsed
+
+        auth.headers = captured_headers
+        auth.body_template = captured_template
+
+        template_size = len(json.dumps(captured_template))
         logger.info(f"Captured {len(auth.headers)} headers + template ({template_size:,} bytes, tools stripped)")
-        logger.info(f"New Auth code: {auth.headers.get("Authorization", "Error - No Auth Found")}")
+        logger.info(f"New Auth code: {auth.headers.get('Authorization', 'Error - No Auth Found')}")
 
     # Forward to real API
     async with aiohttp.ClientSession() as session:
         async with session.post(real_url, data=body, headers=headers) as resp:
             resp_body = await resp.read()
-            return web.Response(body=resp_body, status=resp.status,
-                headers={"Content-Type": resp.headers.get("Content-Type", "text/event-stream")})
+            return web.Response(
+                body=resp_body,
+                status=resp.status,
+                headers={"Content-Type": resp.headers.get("Content-Type", "text/event-stream")},
+            )
+
 
 async def capture_auth():
     # Use clean temp dir to minimize system-reminder bloat (no CLAUDE.md, no skills)
@@ -151,18 +209,35 @@ async def capture_auth():
 
         logger.info("Capturing auth from claude --print...")
         proc = await asyncio.create_subprocess_exec(
-            CLAUDE_PATH, "--print",
-            "--output-format", "text",
-            "--model", DEFAULT_MODEL,
+            CLAUDE_PATH,
+            "--print",
+            "--output-format",
+            "text",
+            "--model",
+            DEFAULT_MODEL,
             "--no-session-persistence",
-            "--system-prompt", "Say ok",
+            "--system-prompt",
+            "Say ok",
             "ok",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=tmpdir,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=60)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            with suppress(Exception):
+                await proc.wait()
+            raise
+
+        if proc.returncode != 0:
+            err = (stderr or b"").decode("utf-8", errors="replace")[:800]
+            out = (stdout or b"").decode("utf-8", errors="replace")[:800]
+            logger.error(f"claude --print failed rc={proc.returncode}\nSTDERR:\n{err}\nSTDOUT:\n{out}")
+            raise RuntimeError("claude --print failed while capturing auth")
+
 
 async def start_interceptor():
     """Start MITM interceptor and capture auth from a clean temp dir."""
@@ -191,8 +266,6 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
         body["system"].append({"type": "text", "text": system_prompt})
 
     # 2. Build full conversation, preserving template auth blocks in first user msg
-    # The template's first user message contains system-reminder content blocks
-    # that authenticate this as a Claude Code request — we must keep them.
     auth_blocks = []
     template_first = body["messages"][0] if body["messages"] else {}
     if isinstance(template_first.get("content"), list):
@@ -204,7 +277,6 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
     new_messages = []
     for i, m in enumerate(messages):
         if i == 0 and m["role"] == "user":
-            # First user message: prepend auth blocks from template
             content = auth_blocks + [{"type": "text", "text": m["content"]}]
             new_messages.append({"role": "user", "content": content})
         else:
@@ -220,7 +292,6 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
 
 async def call_api_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int) -> str:
     """Direct API call, collects full response (non-streaming to caller)."""
-
     body = _build_api_body(system_prompt, messages, model)
     headers = dict(auth.headers)
     body_bytes = json.dumps(body).encode("utf-8")
@@ -231,6 +302,7 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
     start = time.time()
 
     session = auth.session or aiohttp.ClientSession()
+    owns_session = auth.session is None
     try:
         async with session.post(
             "https://api.anthropic.com/v1/messages?beta=true",
@@ -244,9 +316,8 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
                 error_text = error_body.decode("utf-8", errors="replace")
                 logger.error(f"[{request_id}] API {resp.status}: {error_text[:300]}")
                 if resp.status in (401, 403) or "credential" in error_text.lower():
-                    logger.warning("Auth expired")
-                    auth.headers = None
-                    auth.body_template = None
+                    logger.warning("Auth expired/invalid (direct)")
+                    auth.invalidate()
                 raise HTTPException(status_code=resp.status, detail=error_text[:200])
 
             resp_body = await resp.read()
@@ -279,91 +350,141 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
             logger.info(f"[{request_id}] <- {len(response_text)} chars ({elapsed:.1f}s)")
             return response_text
     finally:
-        if not auth.session:
-            await session.close()
-
-
-async def call_api_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int):
-    """Direct API call, yields OpenAI-format SSE chunks as they arrive."""
-
-    body = _build_api_body(system_prompt, messages, model)
-    headers = dict(auth.headers)
-    body_bytes = json.dumps(body).encode("utf-8")
-    headers["Content-Length"] = str(len(body_bytes))
-
-    request_id = uuid.uuid4().hex[:8]
-    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-    created = int(time.time())
-    logger.info(f"[{request_id}] -> {model} ({len(messages)} msgs, stream)")
-    start = time.time()
-    total_chars = 0
-
-    session = auth.session or aiohttp.ClientSession()
-    owns_session = not auth.session
-    try:
-        async with session.post(
-            "https://api.anthropic.com/v1/messages?beta=true",
-            data=body_bytes,
-            headers=headers,
-        ) as resp:
-            if resp.status != 200:
-                error_body = await resp.read()
-                error_text = error_body.decode("utf-8", errors="replace")
-                logger.error(f"[{request_id}] API {resp.status}: {error_text[:300]}")
-                if resp.status in (401, 403) or "credential" in error_text.lower():
-                    logger.warning("Auth expired")
-                    auth.headers = None
-                    auth.body_template = None
-                # Yield an error chunk so client sees the failure
-                err_chunk = {"id": cmpl_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                             "choices": [{"index": 0, "delta": {"content": f"[API Error {resp.status}]"}, "finish_reason": None}]}
-                yield f"data: {json.dumps(err_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-                raise HTTPException(status_code=resp.status, detail=error_text[:200])
-
-            # Stream Claude SSE -> OpenAI SSE
-            # Send initial chunk with role
-            role_chunk = {"id": cmpl_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                          "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
-            yield f"data: {json.dumps(role_chunk)}\n\n"
-
-            buffer = ""
-            async for raw_chunk in resp.content.iter_any():
-                buffer += raw_chunk.decode("utf-8", errors="replace")
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:].strip()
-                    if not data_str or data_str == "[DONE]":
-                        continue
-                    try:
-                        event = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if event.get("type") == "content_block_delta":
-                        delta = event.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                total_chars += len(text)
-                                oai_chunk = {"id": cmpl_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                             "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
-                                yield f"data: {json.dumps(oai_chunk)}\n\n"
-
-            # Final chunk with finish_reason
-            stop_chunk = {"id": cmpl_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                          "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-            yield f"data: {json.dumps(stop_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-
-            elapsed = time.time() - start
-            logger.info(f"[{request_id}] <- {total_chars} chars ({elapsed:.1f}s, streamed)")
-    finally:
         if owns_session:
             await session.close()
+
+
+async def call_api_streaming_with_retry(system_prompt: Optional[str], messages: list, model: str, max_tokens: int):
+    """
+    Direct API call, yields OpenAI-format SSE chunks as they arrive.
+    Retries ONCE on 401/403 by forcing a single-flight auth refresh before yielding any chunks.
+    """
+    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+    created = int(time.time())
+
+    for attempt in range(2):
+        await auth.ensure_ready(timeout=60)
+
+        body = _build_api_body(system_prompt, messages, model)
+        headers = dict(auth.headers)
+        body_bytes = json.dumps(body).encode("utf-8")
+        headers["Content-Length"] = str(len(body_bytes))
+
+        request_id = uuid.uuid4().hex[:8]
+        logger.info(f"[{request_id}] -> {model} ({len(messages)} msgs, stream, attempt={attempt+1})")
+        start = time.time()
+        total_chars = 0
+
+        session = auth.session or aiohttp.ClientSession()
+        owns_session = auth.session is None
+        try:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages?beta=true",
+                data=body_bytes,
+                headers=headers,
+            ) as resp:
+                # If auth invalid, refresh and retry BEFORE yielding anything.
+                if resp.status in (401, 403) and attempt == 0:
+                    error_text = (await resp.read()).decode("utf-8", errors="replace")[:300]
+                    logger.warning(f"[{request_id}] Auth invalid during stream start: {error_text}")
+                    auth.invalidate()
+                    await auth.ensure_ready(force=True, timeout=60)
+                    continue
+
+                if resp.status != 200:
+                    error_body = await resp.read()
+                    error_text = error_body.decode("utf-8", errors="replace")
+                    logger.error(f"[{request_id}] API {resp.status}: {error_text[:300]}")
+                    if resp.status in (401, 403) or "credential" in error_text.lower():
+                        logger.warning("Auth expired/invalid (stream)")
+                        auth.invalidate()
+
+                    err_chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"[API Error {resp.status}]"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # Stream Claude SSE -> OpenAI SSE
+                role_chunk = {
+                    "id": cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(role_chunk)}\n\n"
+
+                buffer = ""
+                async for raw_chunk in resp.content.iter_any():
+                    buffer += raw_chunk.decode("utf-8", errors="replace")
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if not data_str or data_str == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if event.get("type") == "content_block_delta":
+                            delta = event.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    total_chars += len(text)
+                                    oai_chunk = {
+                                        "id": cmpl_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(oai_chunk)}\n\n"
+
+                stop_chunk = {
+                    "id": cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(stop_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+                elapsed = time.time() - start
+                logger.info(f"[{request_id}] <- {total_chars} chars ({elapsed:.1f}s, streamed)")
+                return
+        finally:
+            if owns_session:
+                await session.close()
+
+    # If we somehow got here, retry didn't help
+    err_chunk = {
+        "id": cmpl_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": "[Auth refresh failed]"}, "finish_reason": None}],
+    }
+    yield f"data: {json.dumps(err_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+    return
 
 
 # --- OpenRouter API calls ---
@@ -388,10 +509,12 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
     start = time.time()
 
     session = auth.session or aiohttp.ClientSession()
+    owns_session = auth.session is None
     try:
         async with session.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            json=payload, headers=headers,
+            json=payload,
+            headers=headers,
         ) as resp:
             elapsed = time.time() - start
             if resp.status != 200:
@@ -403,7 +526,7 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
             logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, OpenRouter)")
             return text
     finally:
-        if not auth.session:
+        if owns_session:
             await session.close()
 
 
@@ -429,24 +552,28 @@ async def call_openrouter_streaming(system_prompt: Optional[str], messages: list
     start = time.time()
 
     session = auth.session or aiohttp.ClientSession()
-    owns_session = not auth.session
+    owns_session = auth.session is None
     try:
         async with session.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            json=payload, headers=headers,
+            json=payload,
+            headers=headers,
         ) as resp:
             if resp.status != 200:
                 error_body = await resp.text()
                 logger.error(f"[{request_id}] OpenRouter {resp.status}: {error_body[:300]}")
                 cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-                err_chunk = {"id": cmpl_id, "object": "chat.completion.chunk",
-                             "created": int(time.time()), "model": model,
-                             "choices": [{"index": 0, "delta": {"content": f"[OpenRouter Error {resp.status}]"}, "finish_reason": None}]}
+                err_chunk = {
+                    "id": cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": f"[OpenRouter Error {resp.status}]"}, "finish_reason": None}],
+                }
                 yield f"data: {json.dumps(err_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
-            # OpenRouter returns OpenAI-format SSE — passthrough directly
             buffer = ""
             async for raw_chunk in resp.content.iter_any():
                 buffer += raw_chunk.decode("utf-8", errors="replace")
@@ -472,6 +599,7 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
+
 class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: list[ChatMessage]
@@ -484,26 +612,33 @@ class ChatRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app):
     runner = await start_interceptor()
-    await capture_auth()
-    yield
-    if auth.session:
-        await auth.session.close()
-    await runner.cleanup()
+
+    # Persistent outgoing HTTP session
+    auth.session = aiohttp.ClientSession()
+
+    # Capture auth at startup (single-flight safe)
+    await auth.ensure_ready(force=True, timeout=60)
+
+    try:
+        yield
+    finally:
+        if auth.session:
+            await auth.session.close()
+            auth.session = None
+        await runner.cleanup()
+
 
 app = FastAPI(title="Claude SkyrimNet Proxy", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, retry=True):
+async def chat_completions(req: ChatRequest):
     # Parse model list and pick via round-robin
     model_field = req.model or DEFAULT_MODEL
     models = parse_model_list(model_field)
     model = pick_model_round_robin(models) if len(models) > 1 else models[0]
     use_openrouter = is_openrouter_model(model)
-
-    if not use_openrouter and not auth.is_ready:
-        raise HTTPException(status_code=503, detail="Auth not ready -- warming up")
 
     system_prompt = None
     anthropic_messages = []
@@ -528,7 +663,6 @@ async def chat_completions(req: ChatRequest, retry=True):
             merged.append(msg)
 
     max_tokens = req.max_tokens or 4096
-
     extra_params = {k: v for k, v in (req.model_extra or {}).items() if v is not None}
 
     # Route to correct provider
@@ -541,24 +675,33 @@ async def chat_completions(req: ChatRequest, retry=True):
             )
         response = await call_openrouter_direct(system_prompt, merged, model, max_tokens, **extra_params)
     else:
+        # Ensure auth is available (queues behind refresh if one is in progress)
         try:
-            if req.stream:
-                return StreamingResponse(
-                    call_api_streaming(system_prompt, merged, model, max_tokens),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                )
-            response = await call_api_direct(system_prompt, merged, model, max_tokens)
-        except HTTPException as e:
-            # Catching the auth invalidated
-            if e.status_code == 401 and retry == True:
-                auth.body_template = None
-                auth.headers = None
-                await capture_auth()
+            await auth.ensure_ready(timeout=60)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Auth not ready -- warming up")
 
-                # Recurse back in, hopefully now with renewed auth
-                return await chat_completions(req, False)
-            raise e
+        if req.stream:
+            # Streaming must handle retry inside the generator (can't be caught outside)
+            return StreamingResponse(
+                call_api_streaming_with_retry(system_prompt, merged, model, max_tokens),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # Non-stream: retry once after a forced refresh on 401/403
+        response = None
+        for attempt in range(2):
+            try:
+                response = await call_api_direct(system_prompt, merged, model, max_tokens)
+                break
+            except HTTPException as e:
+                if e.status_code in (401, 403) and attempt == 0:
+                    logger.warning("Auth invalid -> forcing refresh once and retrying request")
+                    auth.invalidate()
+                    await auth.ensure_ready(force=True, timeout=60)
+                    continue
+                raise
 
     if not response:
         raise HTTPException(status_code=500, detail="Empty response")
@@ -572,11 +715,13 @@ async def chat_completions(req: ChatRequest, retry=True):
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": response, "name": None},
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": response, "name": None},
+                "finish_reason": "stop",
+            }
+        ],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
